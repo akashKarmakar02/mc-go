@@ -1,142 +1,130 @@
 package main
 
 import (
+	"fmt"
 	"math"
-	"math/rand"
-	"runtime"
-	"sync"
+	"mcgo/voxel"
 
 	"github.com/aquilax/go-perlin"
 	rl "github.com/gen2brain/raylib-go/raylib"
-
-	"mcgo/voxel"
 )
-
-const (
-	gridSize     = 30
-	blockSpacing = 2.0
-
-	perlinScale = 0.1
-	perlinAlpha = 2.0
-	perlinBeta  = 2.0
-	perlinN     = 3
-)
-
-type RenderData struct {
-	Block        voxel.VoxelBlock
-	VisibleFaces []int
-}
 
 func main() {
-	rl.InitWindow(0, 0, "Voxel Terrain Optimized")
+	rl.SetConfigFlags(rl.FlagWindowResizable)
+	rl.InitWindow(800, 600, "Voxel Engine")
 	defer rl.CloseWindow()
-	rl.ToggleFullscreen()
+
+	// Do NOT call SetConfigFlags with VSyncHint or remove it if you have
+	rl.SetTargetFPS(0)
 	rl.DisableCursor()
-	rl.SetTargetFPS(0) // uncapped
+	voxel.InitGlobalVoxelMesh(1.0)
 
-	camera := rl.Camera{
-		Position: rl.NewVector3(30, 40, 30),
-		Target:   rl.NewVector3(0, 0, 0),
-		Up:       rl.NewVector3(0, 1, 0),
-		Fovy:     60,
-	}
+	// Load some textures
+	dirtTexture := rl.LoadTexture("texture/dirt.png")
+	grassSideTexture := rl.LoadTexture("texture/grass-side.png")
+	grassTopTexture := rl.LoadTexture("texture/grass-top.png")
+	defer rl.UnloadTexture(dirtTexture)
+	defer rl.UnloadTexture(grassTopTexture)
+	defer rl.UnloadTexture(grassSideTexture)
 
-	world := make(map[[3]int]voxel.VoxelBlock)
+	rl.SetTextureFilter(dirtTexture, rl.FilterPoint)
 
-	// Perlin noise terrain generation
-	seed := rand.Int63()
-	noise := perlin.NewPerlin(perlinAlpha, perlinBeta, perlinN, seed)
+	// Texture atlas
+	atlas := voxel.NewTextureAtlas()
+	atlas.SetBlockTexture(voxel.BlockGrass, voxel.FaceTop, grassTopTexture)
+	atlas.SetBlockTexture(voxel.BlockGrass, voxel.FaceBottom, dirtTexture)
+	atlas.SetBlockTexture(voxel.BlockGrass, voxel.FaceFront, grassSideTexture)
+	atlas.SetBlockTexture(voxel.BlockGrass, voxel.FaceBack, grassSideTexture)
+	atlas.SetBlockTexture(voxel.BlockGrass, voxel.FaceLeft, grassSideTexture)
+	atlas.SetBlockTexture(voxel.BlockGrass, voxel.FaceRight, grassSideTexture)
 
-	for x := -gridSize / 2; x < gridSize/2; x++ {
-		for z := -gridSize / 2; z < gridSize/2; z++ {
-			raw := noise.Noise2D(float64(x)*perlinScale, float64(z)*perlinScale)
-			height := int(math.Floor((raw + 1.0) * 0.5 * 6)) // Clamp to 0–6
+	// Camera
+	camera := rl.NewCamera3D(
+		rl.NewVector3(10, 20, 10),
+		rl.NewVector3(0, 0, 0),
+		rl.NewVector3(0, 1, 0),
+		45.0, rl.CameraPerspective,
+	)
 
+	// Terrain generation using Perlin
+	chunk := voxel.NewChunk()
+	perlinGen := perlin.NewPerlin(2, 2, 3, 42) // octaves, persistence, lacunarity, seed
+
+	for x := -32; x <= 32; x++ {
+		for z := -32; z <= 32; z++ {
+			// Get height from Perlin noise
+			noise := perlinGen.Noise2D(float64(x)*0.1, float64(z)*0.1)
+			height := int(math.Round((noise + 1.0) * 4.0)) // convert [-1,1] to [0,8]
 			for y := 0; y <= height; y++ {
-				blockType := voxel.BlockDirt
-				if y == height {
-					blockType = voxel.BlockGrass
+				block := voxel.Block{
+					Position: rl.NewVector3(float32(x), float32(y), float32(z)),
+					Type:     voxel.BlockGrass,
+					Size:     1.0,
 				}
-
-				gridPos := [3]int{x, y, z}
-				world[gridPos] = voxel.VoxelBlock{
-					Position: rl.NewVector3(float32(x)*blockSpacing, float32(y)*blockSpacing, float32(z)*blockSpacing),
-					Type:     blockType,
-				}
+				chunk.AddBlock(block)
 			}
 		}
 	}
 
-	// Pre-allocate slices
-	renderQueue := make([]RenderData, 0, len(world))
-	// visibleFaces := make([]int, 0, 6)
-
 	for !rl.WindowShouldClose() {
-		rl.UpdateCamera(&camera, rl.CameraFree)
+		dt := rl.GetFrameTime()
+		updateFreeCamera(&camera, dt)
 
-		renderQueue = renderQueue[:0] // reuse slice
-
-		// MULTITHREADED face culling
-		var wg sync.WaitGroup
-		jobs := make(chan [3]int, len(world))
-		results := make(chan RenderData, len(world))
-
-		numWorkers := runtime.NumCPU()
-		wg.Add(numWorkers)
-		for i := 0; i < numWorkers; i++ {
-			go func() {
-				defer wg.Done()
-				for pos := range jobs {
-					block := world[pos]
-					if block.Type == voxel.BlockAir {
-						continue
-					}
-
-					var faces []int
-					for face := 0; face < 6; face++ {
-						dir := voxel.FaceDirs[face]
-						nx, ny, nz := pos[0]+int(dir.X), pos[1]+int(dir.Y), pos[2]+int(dir.Z)
-						neighbor, exists := world[[3]int{nx, ny, nz}]
-						if !exists || neighbor.Type == voxel.BlockAir {
-							faces = append(faces, face)
-						}
-					}
-
-					// Frustum culling: skip far blocks
-					blockPos := block.Position
-					if rl.Vector3Distance(camera.Position, blockPos) < 80 {
-						results <- RenderData{Block: block, VisibleFaces: faces}
-					}
-				}
-			}()
-		}
-
-		for pos := range world {
-			jobs <- pos
-		}
-		close(jobs)
-
-		// Wait in background
-		go func() {
-			wg.Wait()
-			close(results)
-		}()
-
-		for r := range results {
-			renderQueue = append(renderQueue, r)
-		}
-
-		// DRAW
 		rl.BeginDrawing()
-		rl.ClearBackground(rl.SkyBlue)
+		rl.ClearBackground(rl.RayWhite)
 		rl.BeginMode3D(camera)
 
-		for _, data := range renderQueue {
-			data.Block.Render(data.VisibleFaces)
-		}
+		chunk.Render(atlas, voxel.GlobalVoxelMesh)
 
 		rl.EndMode3D()
-		rl.DrawFPS(10, 10)
+		rl.DrawText(fmt.Sprintf("FPS: %d", rl.GetFPS()), 10, 10, 20, rl.Black)
 		rl.EndDrawing()
 	}
+}
+
+var yaw float32 = -90.0 // Start facing forward
+var pitch float32 = 0.0 // Looking level
+
+func updateFreeCamera(cam *rl.Camera3D, dt float32) {
+	moveSpeed := float32(10.0) * dt
+	sensitivity := float32(100.0) * dt
+
+	mouseDelta := rl.GetMouseDelta()
+	yaw += mouseDelta.X * sensitivity
+	pitch -= mouseDelta.Y * sensitivity
+
+	// Clamp pitch
+	if pitch > 89.0 {
+		pitch = 89.0
+	}
+	if pitch < -89.0 {
+		pitch = -89.0
+	}
+
+	// Calculate new direction
+	dirX := float32(math.Cos(float64(rl.Deg2rad*yaw)) * math.Cos(float64(rl.Deg2rad*pitch)))
+	dirY := float32(math.Sin(float64(rl.Deg2rad * pitch)))
+	dirZ := float32(math.Sin(float64(rl.Deg2rad*yaw)) * math.Cos(float64(rl.Deg2rad*pitch)))
+	direction := rl.NewVector3(dirX, dirY, dirZ)
+	cam.Target = rl.Vector3Add(cam.Position, rl.Vector3Normalize(direction))
+
+	// WASD movement
+	forward := rl.Vector3Normalize(rl.Vector3Subtract(cam.Target, cam.Position))
+	right := rl.Vector3Normalize(rl.Vector3CrossProduct(forward, cam.Up))
+
+	if rl.IsKeyDown(rl.KeyW) {
+		cam.Position = rl.Vector3Add(cam.Position, rl.Vector3Scale(forward, moveSpeed))
+	}
+	if rl.IsKeyDown(rl.KeyS) {
+		cam.Position = rl.Vector3Subtract(cam.Position, rl.Vector3Scale(forward, moveSpeed))
+	}
+	if rl.IsKeyDown(rl.KeyA) {
+		cam.Position = rl.Vector3Subtract(cam.Position, rl.Vector3Scale(right, moveSpeed))
+	}
+	if rl.IsKeyDown(rl.KeyD) {
+		cam.Position = rl.Vector3Add(cam.Position, rl.Vector3Scale(right, moveSpeed))
+	}
+
+	// Recalculate target each frame
+	cam.Target = rl.Vector3Add(cam.Position, rl.Vector3Normalize(direction))
 }
