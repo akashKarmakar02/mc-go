@@ -11,8 +11,10 @@ import (
 
 func main() {
 	rl.SetConfigFlags(rl.FlagWindowResizable)
-	rl.InitWindow(800, 600, "Voxel Engine")
+	rl.InitWindow(0, 0, "Voxel Engine")
 	defer rl.CloseWindow()
+
+	rl.ToggleFullscreen()
 
 	// Do NOT call SetConfigFlags with VSyncHint or remove it if you have
 	rl.SetTargetFPS(0)
